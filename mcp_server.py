@@ -21,9 +21,14 @@ When the user gives you pictures to turn into 3D, work like this:
    which show a DIFFERENT object or variant, and differences that matter (shape, stones/details,
    colour/material, missing parts, busy backgrounds, blur, crops, hands or reflections).
 3. Ask what they want before rendering. Typical questions: fuse these photos into one model, or
-   one model each? Which photo is the main/front view (it goes first / gets the highest weight)?
-   Leave any photo out? Quality: 512 fast, 1024 standard, 1536 high. Texture 2048 or 4096?
-   A couple of seeds as variations?
+   one model each? Which photo is the MAIN view? Leave any photo out? Quality: 512 fast,
+   1024 standard, 1536 high. Texture 2048 or 4096? A couple of seeds as variations?
+   The main photo goes FIRST in images: it alone decides the overall 3D layout (structure='main'),
+   the others add shape detail and texture. Recommend the photo that shows the most of the object,
+   ideally a 3/4 corner view with two sides visible. HARD RULE: the main photo must show the WHOLE
+   object with a margin; if any part runs off the frame edge (a cut-off wing, roof or base), do not
+   use it as main: the model will build a broken half-object (verified on a house). If no photo
+   shows the whole object, say so and ask for one before rendering.
 4. Sum up the plan in a few lines, then call start_render ONCE with every job (the model takes
    minutes to load, so batch everything into one run).
 5. A render takes several minutes per model: check job_status occasionally, not in a tight loop.
@@ -32,8 +37,9 @@ When the user gives you pictures to turn into 3D, work like this:
 Limits to be upfront about: TRELLIS.2 only follows pictures. It cannot apply text edits
 ("make the band thinner", "make the stone oval"); for that the user needs a photo or edited image
 showing the change. Fusing photos of different objects gives a muddled hybrid, not a clean merge.
-Multi-photo fusion is training-free and experimental: if a fused result looks worse than the best
-single photo, offer a single-photo render of that one. Clean photos on plain backgrounds work best.
+Multi-photo fusion is training-free: if a fused result looks worse than the best single photo,
+offer a single-photo render of that one (or a different main photo). Keep structure='main' unless
+all photos were taken from nearly the same angle. Clean photos on plain backgrounds work best.
 One GPU job at a time; it will refuse to start while another TRELLIS job or the Gradio app runs.
 """.strip()
 
@@ -142,6 +148,10 @@ class RenderJob(BaseModel):
         "stochastic", description="Fusion mode for 2+ photos: 'stochastic' (fast) or 'multidiffusion' "
                                   "(about N times slower, steadier blend).")
     weights: Optional[list[float]] = Field(None, description="Optional importance per photo, e.g. [2, 1, 1].")
+    structure: Literal["main", "fused"] = Field(
+        "main", description="'main' (default): the overall 3D layout comes from the FIRST photo only and all "
+                            "photos add detail and texture. 'fused' also blends the layout (only for photos "
+                            "taken from nearly the same angle; tears when they are far apart).")
     seed: Optional[int] = Field(None, description="Seed; change it for a different variation.")
 
 
@@ -163,7 +173,7 @@ def start_render(jobs: list[RenderJob], output_dir: Optional[str] = None,
         missing = [p for p in imgs if not Path(p).is_file()]
         if missing:
             return f"Job '{j.name}': image(s) not found: {missing}"
-        d = {"name": j.name, "images": imgs, "mode": j.mode}
+        d = {"name": j.name, "images": imgs, "mode": j.mode, "structure": j.structure}
         if j.weights is not None: d["weights"] = j.weights
         if j.seed is not None: d["seed"] = j.seed
         plan_jobs.append(d)

@@ -7,8 +7,15 @@ Generate GLBs from reference images:
     python -u gen.py --plan plan.json                                 # multi-photo jobs (see gen.py docstring)
 
 Multi-photo flow (branch multi-image, fork github.com/dylanmoulder/TRELLIS.2):
-- pipeline.run_multi_image(images, mode='stochastic'|'multidiffusion', weights=[...]) fuses several
-  photos of ONE object into one model (training-free, ported from TRELLIS v1). Main photo first.
+- pipeline.run_multi_image(images, mode='stochastic'|'multidiffusion', weights=[...], structure='main')
+  fuses several photos of ONE object into one model (training-free).
+  structure='main' (default): coarse layout from images[0] ONLY, all photos fused for shape detail
+  + texture. Blending the layout stage ('fused') tears objects apart when photos are far apart,
+  because TRELLIS.2 guesses the object's facing per photo (cond views are rendered all around the
+  asset in data_toolkit/render_cond.py). Verified on Monticello front+corner, 2026-11-23.
+- Photo rules for game assets: main photo FIRST, whole object in frame with margin (a cut-off
+  main photo builds a broken half-object), 3/4 corner view ideal; extra photos = other sides/back,
+  also uncropped, same lighting, uncluttered background.
 - The trellis2 MCP server (mcp_server.py) drives it from chat: look_at_images -> ask the user about
   differences / what they want -> start_render (one call, all jobs) -> job_status -> view_result.
   Its workflow instructions live in INSTRUCTIONS in mcp_server.py.

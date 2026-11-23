@@ -560,11 +560,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         tex_slat_sampler_params: dict,
         return_latent: bool,
         max_num_tokens: int,
+        ss_cond: Optional[dict] = None,
     ):
-        """Sampling + decoding shared by run() and run_multi_image()."""
+        """Sampling + decoding shared by run() and run_multi_image().
+        ss_cond: conditioning for the sparse-structure stage only (default: cond_512)."""
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
-            cond_512, ss_res,
+            ss_cond if ss_cond is not None else cond_512, ss_res,
             num_samples, sparse_structure_sampler_params
         )
         if pipeline_type == '512':
@@ -619,10 +621,17 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return out_mesh
 
     # ------------------------------------------------------------------
-    # Multi-image conditioning (training-free, ported from TRELLIS v1).
-    # The model was trained on single images; these modes blend several
-    # images' guidance during sampling. Works best when every photo shows
-    # the same object (different angles), each cleanly on a plain background.
+    # Multi-image conditioning (training-free, extends the TRELLIS v1 trick).
+    #
+    # Why structure comes from ONE photo by default: TRELLIS.2 was trained with
+    # condition images rendered from random views all around each asset
+    # (data_toolkit/render_cond.py), so every photo makes the model guess the
+    # object's canonical facing on its own. Two photos of a house can get
+    # different guesses, and blending them in the sparse-structure stage tears
+    # the layout apart. The shape and texture stages instead receive that layout
+    # (the coords) and were trained to register ANY view against it, so they can
+    # take every photo. Hence structure='main': layout from images[0], detail and
+    # texture fused from all photos.
     # ------------------------------------------------------------------
     def get_multi_cond(self, images: List[Image.Image], resolution: int) -> dict:
         """Encode images one at a time (keeps peak VRAM low) and stack them: cond [N, T, C], neg_cond [1, T, C]."""
@@ -646,18 +655,24 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         num_images: int,
         mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
         weights: Optional[List[float]] = None,
+        stages: Sequence[str] = ('sparse_structure', 'shape', 'tex'),
     ):
         """
-        Temporarily make all three samplers follow several stacked image conditions.
+        Temporarily make the chosen stages' samplers follow several stacked image conditions.
 
         - 'stochastic': each denoising step uses ONE image, rotating through them in proportion
           to `weights` (highest weight first). Same cost as a single-image run.
         - 'multidiffusion': every step averages the (weighted) predictions of ALL images.
           About num_images times more model calls; usually a more faithful blend.
+        stages: any of 'sparse_structure', 'shape', 'tex'.
         """
         weights = self._normalize_weights(num_images, weights)
-        targets = list({id(s): s for s in (
-            self.sparse_structure_sampler, self.shape_slat_sampler, self.tex_slat_sampler)}.values())
+        by_stage = {'sparse_structure': self.sparse_structure_sampler,
+                    'shape': self.shape_slat_sampler, 'tex': self.tex_slat_sampler}
+        unknown = set(stages) - set(by_stage)
+        if unknown:
+            raise ValueError(f"Unknown stage(s): {sorted(unknown)}")
+        targets = list({id(by_stage[s]): by_stage[s] for s in stages}.values())
         for sampler in targets:
             if mode == 'stochastic':
                 patched = _stochastic_inference(sampler._inference_model, weights)
@@ -680,6 +695,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         seed: int = 42,
         mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
         weights: Optional[List[float]] = None,
+        structure: Literal['main', 'fused'] = 'main',
         sparse_structure_sampler_params: dict = {},
         shape_slat_sampler_params: dict = {},
         tex_slat_sampler_params: dict = {},
@@ -692,10 +708,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Run the pipeline on several photos of the same object and get ONE 3D model.
 
         Args:
-            images: Photos of the object. Put the clearest, most front-on photo first
-                (or give it the highest weight): it drives the first, coarsest sampling step.
+            images: Photos of the object. images[0] is the MAIN photo: the clearest view
+                that shows the most of the object (often a 3/4 corner view).
             mode: 'stochastic' (fast, default) or 'multidiffusion' (slower, steadier blend).
             weights: Optional relative importance per image, e.g. [2, 1, 1].
+            structure: 'main' (default) builds the coarse layout from images[0] only and fuses
+                all photos for shape detail and texture. 'fused' also blends the layout stage
+                (the original TRELLIS v1 behaviour; tears when the photos are far apart).
             Other args: same as run().
         """
         if len(images) == 0:
@@ -715,11 +734,18 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         torch.manual_seed(seed)
         cond_512 = self.get_multi_cond(images, 512)
         cond_1024 = self.get_multi_cond(images, 1024) if pipeline_type != '512' else None
-        with self.inject_sampler_multi_image(len(images), mode=mode, weights=weights):
+        if structure == 'main':
+            stages = ('shape', 'tex')
+            ss_cond = {'cond': cond_512['cond'][:1], 'neg_cond': cond_512['neg_cond']}
+        elif structure == 'fused':
+            stages, ss_cond = ('sparse_structure', 'shape', 'tex'), None
+        else:
+            raise ValueError(f"structure must be 'main' or 'fused', not {structure!r}")
+        with self.inject_sampler_multi_image(len(images), mode=mode, weights=weights, stages=stages):
             return self._sample_from_cond(
                 cond_512, cond_1024, pipeline_type, num_samples,
                 sparse_structure_sampler_params, shape_slat_sampler_params, tex_slat_sampler_params,
-                return_latent, max_num_tokens,
+                return_latent, max_num_tokens, ss_cond=ss_cond,
             )
 
 

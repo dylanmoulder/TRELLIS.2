@@ -18,7 +18,9 @@ src = (P / "trellis2_image_to_3d.py").read_text()
 tree = ast.parse(src)
 import typing
 from fractions import Fraction
-ns = {"List": typing.List, "Optional": typing.Optional, "Fraction": Fraction}
+from contextlib import contextmanager
+ns = {"List": typing.List, "Optional": typing.Optional, "Literal": typing.Literal,
+      "Sequence": typing.Sequence, "Fraction": Fraction, "contextmanager": contextmanager}
 for node in tree.body:
     if isinstance(node, ast.FunctionDef) and node.name in ("_stochastic_inference", "_multidiffusion_inference"):
         exec(compile(ast.Module([node], []), "pipe", "exec"), ns)
@@ -27,6 +29,8 @@ for node in tree.body:
             if isinstance(f, ast.FunctionDef) and f.name == "_normalize_weights":
                 f.decorator_list = []
                 exec(compile(ast.Module([f], []), "pipe", "exec"), ns)
+            if isinstance(f, ast.FunctionDef) and f.name == "inject_sampler_multi_image":
+                exec(compile(ast.Module([f], []), "pipe", "exec"), ns)  # keeps its @contextmanager
 norm = ns["_normalize_weights"]
 
 # ---- real CFG + interval mixins, on a fake linear "flow model"
@@ -91,6 +95,31 @@ for w in ([1, 0, 0], [1, 1, 1], [2, 1, 1]):
 check("extra kwargs (concat_cond) reach the model, sampler kwargs don't",
       all(k == {"concat_cond"} for k in seen_kwargs))
 
+# stage selection: structure='main' must leave the sparse-structure sampler untouched
+class FakePipe:
+    def __init__(self):
+        self.sparse_structure_sampler, self.shape_slat_sampler, self.tex_slat_sampler = Sampler(), Sampler(), Sampler()
+    _normalize_weights = staticmethod(norm)
+pipe = FakePipe()
+inject = ns["inject_sampler_multi_image"]
+with inject(pipe, 2, mode="stochastic", stages=("shape", "tex")):
+    patched = {k for k in ("sparse_structure_sampler", "shape_slat_sampler", "tex_slat_sampler")
+               if "_inference_model" in getattr(pipe, k).__dict__}
+check(f"structure=main patches only shape+tex ({sorted(patched)})", patched == {"shape_slat_sampler", "tex_slat_sampler"})
+check("samplers restored after the block",
+      not any("_inference_model" in s.__dict__ for s in (pipe.sparse_structure_sampler, pipe.shape_slat_sampler, pipe.tex_slat_sampler)))
+with inject(pipe, 2, mode="multidiffusion"):
+    check("default still patches all three stages",
+          all("_inference_model" in s.__dict__ for s in (pipe.sparse_structure_sampler, pipe.shape_slat_sampler, pipe.tex_slat_sampler)))
+try:
+    with inject(pipe, 2, stages=("bogus",)): pass
+    check("unknown stage rejected", False)
+except ValueError:
+    check("unknown stage rejected", True)
+src_run = src[src.index("def run_multi_image"):]
+check("run_multi_image: structure='main' feeds ONLY images[0] to the layout stage",
+      "cond_512['cond'][:1]" in src_run and "stages = ('shape', 'tex')" in src_run and "ss_cond=ss_cond" in src_run)
+
 # ---- gen.py plan parsing (gen.py imports nothing heavy at top level)
 import gen
 tmp = Path(tempfile.mkdtemp())
@@ -108,14 +137,15 @@ check("plan: name sanitised", jobs[0]["name"] == "fused_one")
 check("plan: C:\\ path -> /mnt/c", str(jobs[1]["images"][0]) == "/mnt/c/Windows/win.ini")
 check("plan: defaults + overrides", jobs[1]["seed"] == 9 and jobs[0]["seed"] == 5 and jobs[1]["resolution"] == "512" and preview)
 check("plan: unnamed job named after photo", jobs[1]["name"] == "win")
-bad = {"jobs": [{"name": "x", "images": ["missing.png"], "mode": "nope", "weights": [1, 2]}]}
+check("plan: structure defaults to main", all(j["structure"] == "main" for j in jobs))
+bad = {"jobs": [{"name": "x", "images": ["missing.png"], "mode": "nope", "weights": [1, 2], "structure": "x"}]}
 (tmp / "bad.json").write_text(json.dumps(bad))
 A.plan = str(tmp / "bad.json")
 try:
     gen.build_jobs(A, ap); check("bad plan rejected", False)
 except SystemExit as e:
     msg = str(e); print("   ", msg.replace("\n", "\n    "))
-    check("bad plan rejected with all 3 problems", all(k in msg for k in ("not found", "mode", "weights")))
+    check("bad plan rejected with all 4 problems", all(k in msg for k in ("not found", "mode", "weights", "structure")))
 A.plan, A.inp, A.out = None, str(tmp), str(tmp / "o")
 _, jobs, _, _ = gen.build_jobs(A, ap)
 check("--in folder mode still one job per image", [j["name"] for j in jobs] == ["a", "b"])
@@ -140,7 +170,8 @@ r = m.start_render([m.RenderJob(name="combo", images=[str(p) for p in ex[:2]], w
 pf = Path(launched[0][1])
 p = json.loads(pf.read_text())
 check("start_render writes plan and launches gen.py --plan", launched[0][0] == "--plan" and p["resolution"] == "512"
-      and p["jobs"][0]["weights"] == [2, 1] and "seed" not in p["jobs"][0] and p["jobs"][1]["seed"] == 3)
+      and p["jobs"][0]["weights"] == [2, 1] and "seed" not in p["jobs"][0] and p["jobs"][1]["seed"] == 3
+      and p["jobs"][0]["structure"] == "main")
 _, pj, _, _ = gen.build_jobs(types.SimpleNamespace(plan=str(pf), inp=None, out=None, tex=2048, faces=200000, seed=42, overwrite=False, preview=False), ap)
 check("gen.py accepts the plan the MCP server writes", [j["name"] for j in pj] == ["combo", "solo"])
 (tmp / "render/results.json").write_text(json.dumps({"combo": {"status": "ok", "glb": "/x.glb", "preview": str(ex[0]), "images": ["a", "b"], "mode": "stochastic"}}))

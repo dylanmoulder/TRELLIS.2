@@ -15,8 +15,9 @@ TRELLIS.2 photos -> GLB.
         "preview": true,                           # save <name>_preview.png (4 views)
         "overwrite": false,
         "jobs": [
-          {"name": "ring_combined", "images": ["front.jpg", "side.jpg"],
-           "mode": "stochastic", "weights": [2, 1], "seed": 7},
+          {"name": "ring_combined", "images": ["main_3quarter.jpg", "side.jpg", "back.jpg"],
+           "mode": "stochastic", "weights": [2, 1, 1], "seed": 7,
+           "structure": "main"},                     # layout from images[0]; "fused" = blend it too
           {"name": "ring_variant", "images": ["other.jpg"]}
         ]
       }
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parent
 EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 RESOLUTIONS = {"512": "512", "1024": "1024_cascade", "1536": "1536_cascade"}
 MODES = {"stochastic", "multidiffusion"}
+STRUCTURES = {"main", "fused"}  # main: layout from the first photo, detail+texture from all (see pipeline)
 
 
 def log(*a):
@@ -78,6 +80,7 @@ def build_jobs(a, ap):
                 name=safe_name(j.get("name") or (imgs[0].stem if imgs else "model")),
                 images=imgs,
                 mode=j.get("mode", "stochastic"),
+                structure=j.get("structure", "main"),
                 weights=j.get("weights"),
                 seed=int(j.get("seed", d["seed"])),
                 tex=int(j.get("tex", d["tex"])),
@@ -91,7 +94,7 @@ def build_jobs(a, ap):
             ap.error("use --in and --out, or --plan")
         src, out = wsl_path(a.inp), wsl_path(a.out)
         files = [src] if src.is_file() else sorted(p for p in src.iterdir() if p.suffix.lower() in EXTS)
-        jobs = [dict(name=f.stem, images=[f], mode="stochastic", weights=None, seed=a.seed,
+        jobs = [dict(name=f.stem, images=[f], mode="stochastic", structure="main", weights=None, seed=a.seed,
                      tex=a.tex, faces=a.faces, resolution="1024") for f in files]
         preview, overwrite = a.preview, a.overwrite
 
@@ -104,6 +107,7 @@ def build_jobs(a, ap):
         for p in j["images"]:
             if not p.is_file(): errors.append(f"{n}: image not found: {p}")
         if j["mode"] not in MODES: errors.append(f"{n}: mode must be one of {sorted(MODES)}")
+        if j["structure"] not in STRUCTURES: errors.append(f"{n}: structure must be one of {sorted(STRUCTURES)}")
         if j["resolution"] not in RESOLUTIONS: errors.append(f"{n}: resolution must be one of {list(RESOLUTIONS)}")
         w = j["weights"]
         if w is not None and (len(w) != len(j["images"]) or any(x < 0 for x in w) or sum(w) <= 0):
@@ -175,17 +179,18 @@ def main():
     for idx, j in enumerate(todo):
         name, imgs = j["name"], j["images"]
         dst = out / f"{name}.glb"
-        rec = {"glb": None, "preview": None, "images": [str(p) for p in imgs], "mode": j["mode"],
+        rec = {"glb": None, "preview": None, "images": [str(p) for p in imgs], "mode": j["mode"], "structure": j["structure"],
                "weights": j["weights"], "seed": j["seed"], "resolution": j["resolution"], "status": "failed"}
         try:
-            how = f"{len(imgs)} images fused [{j['mode']}]" if len(imgs) > 1 else imgs[0].name
+            how = (f"{len(imgs)} images fused [{j['mode']}, structure={j['structure']}]"
+                   if len(imgs) > 1 else imgs[0].name)
             log(f"==> {name}: {how}")
             pil = [load_image(p) for p in imgs]
             ptype = RESOLUTIONS[j["resolution"]]
             if len(pil) == 1:
                 mesh = pipeline.run(pil[0], seed=j["seed"], pipeline_type=ptype)[0]
             else:
-                mesh = pipeline.run_multi_image(pil, seed=j["seed"], mode=j["mode"],
+                mesh = pipeline.run_multi_image(pil, seed=j["seed"], mode=j["mode"], structure=j["structure"],
                                                 weights=j["weights"], pipeline_type=ptype)[0]
             if idx == len(todo) - 1:  # last model of this process: drop the models so mesh cleanup gets the VRAM
                 pipeline.models.clear(); pipeline.image_cond_model = pipeline.rembg_model = None

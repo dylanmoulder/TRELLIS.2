@@ -1,6 +1,8 @@
 > **Fork note (`multi-image` branch):** adds multi-photo input. `Trellis2ImageTo3DPipeline.run_multi_image()`
 > fuses several photos of one object into one model (training-free `stochastic` / `multidiffusion` modes,
-> ported from TRELLIS v1, with optional per-photo weights). `gen.py --plan plan.json` renders several
+> optional per-photo weights). By default the coarse layout comes from the first (main) photo only and
+> every photo refines shape detail and texture: TRELLIS.2 guesses an object's facing separately per photo,
+> so blending the layout stage across far-apart views tears the model. `gen.py --plan plan.json` renders several
 > fused or single-photo jobs in one model load, with preview renders. `mcp_server.py` lets an MCP chat
 > client (Claude) look at the photos, ask what you want, then render. Tuned for an 8GB GPU under WSL2.
 
