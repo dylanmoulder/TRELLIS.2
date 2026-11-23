@@ -1,4 +1,6 @@
 from typing import *
+from contextlib import contextmanager
+from fractions import Fraction
 import torch
 import torch.nn as nn
 import numpy as np
@@ -514,7 +516,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
         """
-        # Check pipeline type
+        pipeline_type = self._check_pipeline_type(pipeline_type)
+        if preprocess_image:
+            image = self.preprocess_image(image)
+        torch.manual_seed(seed)
+        cond_512 = self.get_cond([image], 512)
+        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        return self._sample_from_cond(
+            cond_512, cond_1024, pipeline_type, num_samples,
+            sparse_structure_sampler_params, shape_slat_sampler_params, tex_slat_sampler_params,
+            return_latent, max_num_tokens,
+        )
+
+    def _check_pipeline_type(self, pipeline_type: Optional[str]) -> str:
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
@@ -532,12 +546,22 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
-        
-        if preprocess_image:
-            image = self.preprocess_image(image)
-        torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        return pipeline_type
+
+    @torch.no_grad()
+    def _sample_from_cond(
+        self,
+        cond_512: dict,
+        cond_1024: Optional[dict],
+        pipeline_type: str,
+        num_samples: int,
+        sparse_structure_sampler_params: dict,
+        shape_slat_sampler_params: dict,
+        tex_slat_sampler_params: dict,
+        return_latent: bool,
+        max_num_tokens: int,
+    ):
+        """Sampling + decoding shared by run() and run_multi_image()."""
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
@@ -593,3 +617,157 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return out_mesh, (shape_slat, tex_slat, res)
         else:
             return out_mesh
+
+    # ------------------------------------------------------------------
+    # Multi-image conditioning (training-free, ported from TRELLIS v1).
+    # The model was trained on single images; these modes blend several
+    # images' guidance during sampling. Works best when every photo shows
+    # the same object (different angles), each cleanly on a plain background.
+    # ------------------------------------------------------------------
+    def get_multi_cond(self, images: List[Image.Image], resolution: int) -> dict:
+        """Encode images one at a time (keeps peak VRAM low) and stack them: cond [N, T, C], neg_cond [1, T, C]."""
+        cond = torch.cat([self.get_cond([img], resolution, include_neg_cond=False)['cond'] for img in images], dim=0)
+        return {'cond': cond, 'neg_cond': torch.zeros_like(cond[:1])}
+
+    @staticmethod
+    def _normalize_weights(num_images: int, weights: Optional[List[float]]) -> List[float]:
+        if weights is None:
+            return [1.0 / num_images] * num_images
+        if len(weights) != num_images:
+            raise ValueError(f"Got {len(weights)} weights for {num_images} images.")
+        if any(w < 0 for w in weights) or sum(weights) <= 0:
+            raise ValueError("Weights must be >= 0 and not all zero.")
+        total = float(sum(weights))
+        return [float(w) / total for w in weights]
+
+    @contextmanager
+    def inject_sampler_multi_image(
+        self,
+        num_images: int,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+        weights: Optional[List[float]] = None,
+    ):
+        """
+        Temporarily make all three samplers follow several stacked image conditions.
+
+        - 'stochastic': each denoising step uses ONE image, rotating through them in proportion
+          to `weights` (highest weight first). Same cost as a single-image run.
+        - 'multidiffusion': every step averages the (weighted) predictions of ALL images.
+          About num_images times more model calls; usually a more faithful blend.
+        """
+        weights = self._normalize_weights(num_images, weights)
+        targets = list({id(s): s for s in (
+            self.sparse_structure_sampler, self.shape_slat_sampler, self.tex_slat_sampler)}.values())
+        for sampler in targets:
+            if mode == 'stochastic':
+                patched = _stochastic_inference(sampler._inference_model, weights)
+            elif mode == 'multidiffusion':
+                patched = _multidiffusion_inference(sampler, weights)
+            else:
+                raise ValueError(f"Unknown multi-image mode: {mode!r}")
+            sampler._inference_model = patched  # instance attribute shadows the class method
+        try:
+            yield
+        finally:
+            for sampler in targets:
+                sampler.__dict__.pop('_inference_model', None)
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        mode: Literal['stochastic', 'multidiffusion'] = 'stochastic',
+        weights: Optional[List[float]] = None,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline on several photos of the same object and get ONE 3D model.
+
+        Args:
+            images: Photos of the object. Put the clearest, most front-on photo first
+                (or give it the highest weight): it drives the first, coarsest sampling step.
+            mode: 'stochastic' (fast, default) or 'multidiffusion' (slower, steadier blend).
+            weights: Optional relative importance per image, e.g. [2, 1, 1].
+            Other args: same as run().
+        """
+        if len(images) == 0:
+            raise ValueError("run_multi_image needs at least one image.")
+        if len(images) == 1:
+            return self.run(
+                images[0], num_samples=num_samples, seed=seed,
+                sparse_structure_sampler_params=sparse_structure_sampler_params,
+                shape_slat_sampler_params=shape_slat_sampler_params,
+                tex_slat_sampler_params=tex_slat_sampler_params,
+                preprocess_image=preprocess_image, return_latent=return_latent,
+                pipeline_type=pipeline_type, max_num_tokens=max_num_tokens,
+            )
+        pipeline_type = self._check_pipeline_type(pipeline_type)
+        if preprocess_image:
+            images = [self.preprocess_image(img) for img in images]
+        torch.manual_seed(seed)
+        cond_512 = self.get_multi_cond(images, 512)
+        cond_1024 = self.get_multi_cond(images, 1024) if pipeline_type != '512' else None
+        with self.inject_sampler_multi_image(len(images), mode=mode, weights=weights):
+            return self._sample_from_cond(
+                cond_512, cond_1024, pipeline_type, num_samples,
+                sparse_structure_sampler_params, shape_slat_sampler_params, tex_slat_sampler_params,
+                return_latent, max_num_tokens,
+            )
+
+
+def _stochastic_inference(orig_inference, weights: List[float]):
+    """Each call conditions on one image, picked by smooth weighted round-robin (deterministic).
+    Exact fractions so equal weights give a clean 0,1,2,0,1,2... rotation (no float drift)."""
+    ws = [Fraction(w) for w in weights]
+    total = sum(ws)
+    credit = [Fraction(0)] * len(ws)
+
+    def _inference_model(model, x_t, t, cond=None, **kwargs):
+        for i, w in enumerate(ws):
+            credit[i] += w
+        i = max(range(len(ws)), key=credit.__getitem__)
+        credit[i] -= total
+        return orig_inference(model, x_t, t, cond[i:i + 1], **kwargs)
+
+    return _inference_model
+
+
+def _multidiffusion_inference(sampler, weights: List[float]):
+    """Weighted average of per-image predictions, then the same CFG / interval / rescale as the mixins."""
+    base = samplers.FlowEulerSampler._inference_model
+
+    def _inference_model(model, x_t, t, cond=None, neg_cond=None, guidance_strength=1.0,
+                         guidance_rescale=0.0, guidance_interval=(0.0, 1.0), **kwargs):
+        if not (guidance_interval[0] <= t <= guidance_interval[1]):
+            guidance_strength = 1
+        pred_pos = None
+        for i, w in enumerate(weights):
+            if w == 0:
+                continue
+            p = w * base(sampler, model, x_t, t, cond[i:i + 1], **kwargs)
+            pred_pos = p if pred_pos is None else pred_pos + p
+        if guidance_strength == 1:
+            return pred_pos
+        pred_neg = base(sampler, model, x_t, t, neg_cond, **kwargs)
+        if guidance_strength == 0:
+            return pred_neg
+        pred = guidance_strength * pred_pos + (1 - guidance_strength) * pred_neg
+        if guidance_rescale > 0:
+            x_0_pos = sampler._pred_to_xstart(x_t, t, pred_pos)
+            x_0_cfg = sampler._pred_to_xstart(x_t, t, pred)
+            std_pos = x_0_pos.std(dim=list(range(1, x_0_pos.ndim)), keepdim=True)
+            std_cfg = x_0_cfg.std(dim=list(range(1, x_0_cfg.ndim)), keepdim=True)
+            x_0_rescaled = x_0_cfg * (std_pos / std_cfg)
+            x_0 = guidance_rescale * x_0_rescaled + (1 - guidance_rescale) * x_0_cfg
+            pred = sampler._xstart_to_pred(x_t, t, x_0)
+        return pred
+
+    return _inference_model
